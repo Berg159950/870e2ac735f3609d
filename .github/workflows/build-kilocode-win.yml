@@ -1,0 +1,428 @@
+name: build-kilocode-penryn-win
+
+on:
+  workflow_dispatch:
+    inputs:
+      kilocode_tag:
+        description: KiloCode tag to build (empty = latest stable)
+        required: false
+        default: ""
+      bun_url:
+        description: Penryn Bun archive URL (win-x64 zip)
+        required: false
+        default: ""
+      bun_sha256:
+        description: SHA256 of Bun archive
+        required: false
+        default: ""
+      zig_url:
+        description: Zig download URL
+        required: false
+        default: "https://ziglang.org/download/0.16.0/zig-x86_64-windows-0.16.0.zip"
+      zig_sha256:
+        description: SHA256 of Zig archive
+        required: false
+        default: "68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"
+
+permissions:
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  KILOCODE_TAG: ${{ github.event.inputs.kilocode_tag }}
+  BUN_URL: ${{ github.event.inputs.bun_url }}
+  BUN_SHA256: ${{ github.event.inputs.bun_sha256 }}
+  ZIG_URL: ${{ github.event.inputs.zig_url }}
+  ZIG_SHA256: ${{ github.event.inputs.zig_sha256 }}
+  BWRAP_COMMIT: 1b80120ef26a28e065e67f89bfef873f13bdd317
+  BWRAP_SHA256: 55a1f42de8f62f6cd8cc414229ce166ec6128ca4386b8c25dfca4229e44b56aa
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve KiloCode tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$KILOCODE_TAG" ]; then
+            TAG="$KILOCODE_TAG"
+          else
+            TAG=$(curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/kilo-org/kilocode/releases?per_page=20" | grep -oP '"tag_name":\s*"\Kv[0-9][^"]*' | head -1 || true)
+            if [ -z "$TAG" ]; then
+              TAG=$(curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/kilo-org/kilocode/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' | head -1 || true)
+            fi
+          fi
+          [ -n "$TAG" ] || { echo "Failed to resolve KiloCode tag"; exit 1; }
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "Using KiloCode tag: $TAG"
+
+      - name: Restore intermediate build
+        id: restore
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: build-kilocode-win.yml
+          name: stage-kilocode-win-x64-${{ steps.tag.outputs.version }}-${{ hashFiles('.github/workflows/build-kilocode-win.yml') }}
+          path: ${{ runner.temp }}/stage
+          if_no_artifact_found: warn
+
+      - name: Restore Zig cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        id: zig-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/zig-cache/
+          key: zig-win-${{ env.ZIG_SHA256 }}
+
+      - name: Setup Zig
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          if [ -f "$RUNNER_TEMP/zig-cache/zig.zip" ]; then
+            cp "$RUNNER_TEMP/zig-cache/zig.zip" "$RUNNER_TEMP/zig.zip"
+            echo "Zig restored from cache"
+          else
+            echo "Downloading Zig from $ZIG_URL"
+            for i in 1 2 3 4 5; do
+              if curl -fsSL --connect-timeout 20 --max-time 900 "$ZIG_URL" -o "$RUNNER_TEMP/zig.zip"; then break; fi
+              echo "Zig download attempt $i failed (curl exit $?)"
+              rm -f "$RUNNER_TEMP/zig.zip"
+              [ $i -lt 5 ] && sleep 30
+            done
+            [ -s "$RUNNER_TEMP/zig.zip" ] || { echo "Zig download failed: $ZIG_URL"; exit 1; }
+            if [ -n "$ZIG_SHA256" ]; then
+              echo "$ZIG_SHA256  $RUNNER_TEMP/zig.zip" | sha256sum -c
+            fi
+            mkdir -p "$RUNNER_TEMP/zig-cache"
+            cp "$RUNNER_TEMP/zig.zip" "$RUNNER_TEMP/zig-cache/zig.zip"
+          fi
+          rm -rf "$RUNNER_TEMP/zig-extract"
+          mkdir -p "$RUNNER_TEMP/zig-extract"
+          powershell -NoProfile -Command "Expand-Archive -Path '$RUNNER_TEMP/zig.zip' -DestinationPath '$RUNNER_TEMP/zig-extract'"
+          ZIG_DIR=$(ls -d "$RUNNER_TEMP/zig-extract"/zig-* 2>/dev/null | head -1 || true)
+          if [ -n "$ZIG_DIR" ]; then
+            echo "$ZIG_DIR" >> $GITHUB_PATH
+          else
+            echo "Zig directory not found after extraction"
+            exit 1
+          fi
+
+      - name: Save Zig cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/zig-cache/
+          key: zig-win-${{ env.ZIG_SHA256 }}
+
+      - name: Restore Bun archive cache
+        id: bun-dl-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/bun-dl-cache.zip
+          key: dl-bun-win-${{ env.BUN_SHA256 }}
+
+      - name: Download Bun
+        if: steps.restore.outputs.found_artifact != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          [ -n "$BUN_URL" ] || { echo "BUN_URL is required"; exit 1; }
+          if [ -n "$BUN_SHA256" ] && [ -s "$RUNNER_TEMP/bun-dl-cache.zip" ] && echo "$BUN_SHA256  $RUNNER_TEMP/bun-dl-cache.zip" | sha256sum -c --quiet; then
+            echo "Bun archive restored from cache"
+            cp "$RUNNER_TEMP/bun-dl-cache.zip" "$RUNNER_TEMP/bun.zip"
+          else
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --connect-timeout 20 --max-time 900 -H "Authorization: token $GH_TOKEN" "$BUN_URL" -o "$RUNNER_TEMP/bun.zip" 2>/dev/null && [ -s "$RUNNER_TEMP/bun.zip" ]; then break; fi
+            if curl -fsSL --connect-timeout 20 --max-time 900 "$BUN_URL" -o "$RUNNER_TEMP/bun.zip" && [ -s "$RUNNER_TEMP/bun.zip" ]; then break; fi
+            echo "Bun download attempt $i failed"
+            rm -f "$RUNNER_TEMP/bun.zip"
+            [ $i -lt 5 ] && sleep 30
+          done
+          if [ ! -s "$RUNNER_TEMP/bun.zip" ]; then
+            REPO=$(echo "$BUN_URL" | sed -E 's|https://github.com/([^/]+/[^/]+)/releases/download/.*|\1|')
+            TAG=$(echo "$BUN_URL" | sed -E 's|.*/releases/download/([^/]+)/.*|\1|')
+            FILE=$(basename "$BUN_URL")
+            echo "Direct download failed, trying gh release download for $REPO $TAG $FILE"
+            gh release download "$TAG" --repo "$REPO" --pattern "$FILE" --dir "$RUNNER_TEMP" --clobber 2>&1 || true
+            [ -f "$RUNNER_TEMP/$FILE" ] && mv "$RUNNER_TEMP/$FILE" "$RUNNER_TEMP/bun.zip"
+          fi
+          [ -s "$RUNNER_TEMP/bun.zip" ] || { echo "Bun download failed: $BUN_URL"; exit 1; }
+          if [ -n "$BUN_SHA256" ]; then
+            echo "$BUN_SHA256  $RUNNER_TEMP/bun.zip" | sha256sum -c
+            cp "$RUNNER_TEMP/bun.zip" "$RUNNER_TEMP/bun-dl-cache.zip"
+          fi
+          fi
+
+      - name: Save Bun archive cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/bun-dl-cache.zip
+          key: dl-bun-win-${{ env.BUN_SHA256 }}
+
+      - name: Setup Penryn Bun
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          rm -rf "$RUNNER_TEMP/bun-extract" "$RUNNER_TEMP/penryn-bun"
+          mkdir -p "$RUNNER_TEMP/bun-extract"
+          powershell -NoProfile -Command "Expand-Archive -Path '$RUNNER_TEMP/bun.zip' -DestinationPath '$RUNNER_TEMP/bun-extract'"
+          mkdir -p "$RUNNER_TEMP/penryn-bun/lib"
+          BUN_EXE=$(find "$RUNNER_TEMP/bun-extract" -type f -name "bun.bin.exe" 2>/dev/null | head -1 || true)
+          [ -n "$BUN_EXE" ] || BUN_EXE=$(find "$RUNNER_TEMP/bun-extract" -type f -name "bun.exe" 2>/dev/null | head -1 || true)
+          [ -n "$BUN_EXE" ] || { echo "bun.exe not found in archive"; exit 1; }
+          cp "$BUN_EXE" "$RUNNER_TEMP/penryn-bun/bun.bin.exe"
+          find "$RUNNER_TEMP/bun-extract" -name "*.dll" -exec cp -n {} "$RUNNER_TEMP/penryn-bun/lib/" \; 2>/dev/null || true
+          printf '@echo off\r\n"%%~dp0bun.bin.exe" %%*\r\n' > "$RUNNER_TEMP/penryn-bun/bun.cmd"
+          printf '#!/bin/bash\nDIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\nexec "$DIR/bun.bin.exe" "$@"\n' > "$RUNNER_TEMP/penryn-bun/bun"
+          chmod +x "$RUNNER_TEMP/penryn-bun/bun"
+          echo "$RUNNER_TEMP/penryn-bun" >> $GITHUB_PATH
+
+      - name: Pre-download Bubblewrap source
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          CACHE_DIR="$RUNNER_TEMP/kilo-bubblewrap/$BWRAP_COMMIT"
+          mkdir -p "$CACHE_DIR"
+          if [ -f "$CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" ]; then
+            echo "Bubblewrap already cached"
+          else
+            for i in 1 2 3; do
+              curl -fsSL --connect-timeout 20 --max-time 900 "https://codeload.github.com/containers/bubblewrap/tar.gz/$BWRAP_COMMIT" \
+                -o "$CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" && break
+              [ $i -lt 3 ] && sleep 10
+            done
+            [ -s "$CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" ] || { echo "Bubblewrap download failed"; exit 1; }
+          fi
+          echo "$BWRAP_SHA256  $CACHE_DIR/bubblewrap-$BWRAP_COMMIT.tar.gz" | sha256sum -c
+          echo "KILO_BWRAP_CACHE=$CACHE_DIR" >> $GITHUB_ENV
+
+      - name: Restore source cache
+        id: src-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/kilocode
+          key: src-kilocode-win-${{ steps.tag.outputs.version }}
+
+      - name: Clone KiloCode
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          DIR="${{ github.workspace }}/kilocode"
+          if [ -d "$DIR/.git" ]; then
+            echo "reusing cached kilocode source"
+            cd "$DIR"
+            git fetch --depth 1 origin "${{ steps.tag.outputs.tag }}" || {
+              echo "fetch failed, recloning"
+              rm -rf "$DIR"
+              git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" \
+                https://github.com/kilo-org/kilocode.git "$DIR"
+              cd "$DIR"
+            }
+          else
+            rm -rf "$DIR"
+            for i in 1 2 3; do
+              git clone --depth 1 --branch "${{ steps.tag.outputs.tag }}" \
+                https://github.com/kilo-org/kilocode.git "$DIR" && break
+              [ $i -lt 3 ] && sleep 10
+            done
+          fi
+          [ -d "$DIR/.git" ] || exit 1
+          cd "$DIR"
+          git fetch --depth 1 origin "${{ steps.tag.outputs.tag }}" 2>/dev/null || true
+          git checkout FETCH_HEAD 2>/dev/null || git checkout "${{ steps.tag.outputs.tag }}" || exit 1
+          rm -rf packages/opencode/dist packages/kilo-vscode/out
+
+      - name: Save source cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/kilocode
+          key: src-kilocode-win-${{ steps.tag.outputs.version }}
+
+      - name: Install deps
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          python -m pip install -q gyp-next
+          cd "${{ github.workspace }}/kilocode"
+          bun install --frozen-lockfile
+
+      - name: Build KiloCode CLI
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd "${{ github.workspace }}/kilocode/packages/opencode"
+          bun run build --single --skip-install
+        env:
+          KILO_VERSION: ${{ steps.tag.outputs.version }}
+          KILO_BWRAP_CACHE: ${{ env.KILO_BWRAP_CACHE }}
+
+      - name: Static ISA verify
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          BIN=$(find "${{ github.workspace }}/kilocode/packages/opencode/dist" -type f -name "kilo.exe" 2>/dev/null | head -1 || true)
+          [ -n "$BIN" ] || { echo "kilo.exe not found"; exit 1; }
+          DISASM=$(which objdump llvm-objdump 2>/dev/null | head -1 || true)
+          if [ -z "$DISASM" ]; then
+            echo "WARNING: no objdump available, skipping static ISA verify"
+            exit 0
+          fi
+          "$DISASM" -d "$BIN" > "$RUNNER_TEMP/disasm.txt" 2>/dev/null
+          if grep -qE '\bpopcnt\b' "$RUNNER_TEMP/disasm.txt"; then
+            echo "ERROR: POPCNT instructions present in binary"
+            grep -nE '\bpopcnt\b' "$RUNNER_TEMP/disasm.txt" | head -10
+            exit 1
+          fi
+          echo "OK: zero POPCNT instructions"
+
+      - name: Bundle CLI exe + wrapper
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          CLI_BIN=$(find "${{ github.workspace }}/kilocode/packages/opencode/dist" -type d -path '*cli-windows-x64/bin' 2>/dev/null | head -1 || true)
+          [ -n "$CLI_BIN" ] || CLI_BIN=$(find "${{ github.workspace }}/kilocode/packages/opencode/dist" -type d -path '*/bin' 2>/dev/null | head -1 || true)
+          [ -n "$CLI_BIN" ] || { echo "CLI bin dir not found"; find "${{ github.workspace }}/kilocode/packages/opencode/dist" -maxdepth 3 -type d 2>/dev/null | head -20; exit 1; }
+          mkdir -p "$RUNNER_TEMP/bundle/bin" "$RUNNER_TEMP/bundle/lib"
+          cp -r "$CLI_BIN"/. "$RUNNER_TEMP/bundle/bin/"
+          KILO_EXE=$(find "$RUNNER_TEMP/bundle/bin" -maxdepth 1 -type f -name "kilo.exe" | head -1 || true)
+          [ -n "$KILO_EXE" ] || { echo "kilo.exe not found in bundle"; exit 1; }
+          mv "$KILO_EXE" "$RUNNER_TEMP/bundle/bin/kilo.bin.exe"
+          find "$RUNNER_TEMP/penryn-bun/lib" -name "*.dll" -exec cp -n {} "$RUNNER_TEMP/bundle/lib/" \; 2>/dev/null || true
+          printf '@echo off\r\n"%%~dp0kilo.bin.exe" %%*\r\n' > "$RUNNER_TEMP/bundle/bin/kilo.cmd"
+          printf '#!/bin/bash\nDIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"\nexec "$DIR/kilo.bin.exe" "$@"\n' > "$RUNNER_TEMP/bundle/bin/kilo"
+          chmod +x "$RUNNER_TEMP/bundle/bin/kilo"
+          "$RUNNER_TEMP/bundle/bin/kilo.bin.exe" --version
+
+      - name: Install @vscode/vsce
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          bun install -g @vscode/vsce
+          VSCE_BIN="$(bun pm bin -g 2>/dev/null || echo "$HOME/.bun/bin")"
+          VSCE_BIN_MSYS=$(echo "$VSCE_BIN" | sed 's|^\([A-Za-z]\):|/\L\1|; s|\\|/|g')
+          echo "global bin: $VSCE_BIN_MSYS"
+          ls "$VSCE_BIN_MSYS" | head -20
+          echo "$VSCE_BIN" >> $GITHUB_PATH
+          export PATH="$VSCE_BIN:$PATH"
+          VSCE=$(command -v vsce 2>/dev/null || ls "$VSCE_BIN_MSYS"/vsce* 2>/dev/null | head -1 || true)
+          [ -n "$VSCE" ] || { echo "ERROR: vsce binary not found"; exit 1; }
+          echo "vsce at $VSCE"
+
+      - name: Patch VSIX build to win-x64
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd "${{ github.workspace }}/kilocode/packages/kilo-vscode"
+          bun -e "
+            const fs = require('fs');
+            const f = 'script/build.ts';
+            let src = fs.readFileSync(f, 'utf8');
+            const start = src.indexOf('const targets = [');
+            const end = src.indexOf(']', start) + 1;
+            if (start < 0 || end < 0) { console.error('targets array not found'); process.exit(1); }
+            src = src.slice(0, start) + 'const targets = [\n  { target: \"win32-x64\", cliDir: \"@kilocode/cli-windows-x64\", binary: \"kilo.exe\" },\n]' + src.slice(end);
+            fs.writeFileSync(f, src);
+            console.log('targets patched to win-x64');
+          "
+
+      - name: Build VSIX
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          export PATH="/c/Windows/System32:$PATH"
+          cd "${{ github.workspace }}/kilocode/packages/kilo-vscode"
+          bun run script/build.ts
+        env:
+          CLI_DIST_DIR: ../../packages/opencode/dist
+          KILO_VERSION: ${{ steps.tag.outputs.version }}
+
+      - name: Make VSIX self-contained
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          set -e
+          VSIX=$(ls "${{ github.workspace }}/kilocode/packages/kilo-vscode/out/"*.vsix 2>/dev/null | head -1 || true)
+          [ -n "$VSIX" ] || { echo "No VSIX produced"; exit 1; }
+          echo "VSIX=$VSIX" >> $GITHUB_ENV
+          WORK="$RUNNER_TEMP/vsixwork"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          7z x "$VSIX" -o"$WORK" > /dev/null
+          mv "$WORK/extension/bin/kilo.exe" "$WORK/extension/bin/kilo.bin.exe"
+          printf '@echo off\r\n"%%~dp0kilo.bin.exe" %%*\r\n' > "$WORK/extension/bin/kilo.cmd"
+          mkdir -p "$WORK/extension/lib"
+          find "$RUNNER_TEMP/penryn-bun/lib" -name "*.dll" -exec cp -n {} "$WORK/extension/lib/" \; 2>/dev/null || true
+          chmod 755 "$WORK/extension/bin/kilo.bin.exe"
+          rm -f "$VSIX"
+          cd "$WORK" && 7z a -tzip "$VSIX" extension.vsixmanifest "[Content_Types].xml" extension > /dev/null
+          echo "VSIX made self-contained"
+
+      - name: Verify VSIX
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          ls -la "${{ github.workspace }}/kilocode/packages/kilo-vscode/out/"
+          7z l "$VSIX" | grep -E 'bin/kilo|lib/' | head -10 || true
+          TEST_DIR="$RUNNER_TEMP/vsixtest"
+          rm -rf "$TEST_DIR"
+          mkdir -p "$TEST_DIR"
+          7z x "$VSIX" -o"$TEST_DIR" > /dev/null
+          "$TEST_DIR/extension/bin/kilo.bin.exe" --version
+
+      - name: Stage built CLI + VSIX
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/stage"
+          cp -r "$RUNNER_TEMP/bundle" "$RUNNER_TEMP/stage/cli"
+          cp "${{ github.workspace }}/kilocode/packages/kilo-vscode/out/"*.vsix "$RUNNER_TEMP/stage/"
+          ls -la "$RUNNER_TEMP/stage" "$RUNNER_TEMP/stage/cli/bin"
+
+      - name: Upload intermediate build
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-kilocode-win-x64-${{ steps.tag.outputs.version }}-${{ hashFiles('.github/workflows/build-kilocode-win.yml') }}
+          path: ${{ runner.temp }}/stage
+
+      - name: Use restored build
+        if: steps.restore.outputs.found_artifact == 'true'
+        run: |
+          [ -f "$RUNNER_TEMP/stage/cli/bin/kilo.bin.exe" ] || { echo "restored CLI missing"; ls -la "$RUNNER_TEMP/stage"; exit 1; }
+          ls "$RUNNER_TEMP/stage/"*.vsix || { echo "restored VSIX missing"; ls -la "$RUNNER_TEMP/stage"; exit 1; }
+
+      - name: Package artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/pkg/kilocode-penryn"
+          rm -rf "$RUNNER_TEMP/pkg/kilocode-penryn"
+          mkdir -p "$RUNNER_TEMP/pkg/kilocode-penryn"
+          cp -r "$RUNNER_TEMP/stage/cli" "$RUNNER_TEMP/pkg/kilocode-penryn/cli"
+          cp "$RUNNER_TEMP/stage/"*.vsix "$RUNNER_TEMP/pkg/kilocode-penryn/"
+          rm -f "$RUNNER_TEMP/kilocode-penryn-win-x64.zip"
+          cd "$RUNNER_TEMP/pkg" && 7z a -tzip "$RUNNER_TEMP/kilocode-penryn-win-x64.zip" kilocode-penryn
+
+      - name: Compute SHA256
+        id: sha256
+        run: |
+          SHA=$(sha256sum "$RUNNER_TEMP/kilocode-penryn-win-x64.zip" | cut -d' ' -f1)
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kilocode-penryn-win-x64-${{ steps.tag.outputs.version }}-${{ github.run_id }}
+          name: KiloCode Penryn Win x64 ${{ steps.tag.outputs.version }}
+          body: |
+            KiloCode ${{ steps.tag.outputs.version }} built for Penryn (SSE 4.1), Windows x64
+            SHA256: ${{ steps.sha256.outputs.sha256 }}
+          files: ${{ runner.temp }}/kilocode-penryn-win-x64.zip
+          draft: false
+          prerelease: false
+
+      - name: Upload artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kilocode-penryn-win-x64
+          path: ${{ runner.temp }}/kilocode-penryn-win-x64.zip
