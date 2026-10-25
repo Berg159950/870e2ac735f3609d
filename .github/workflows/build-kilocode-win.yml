@@ -250,6 +250,31 @@ jobs:
           path: ${{ github.workspace }}/kilocode
           key: src-kilocode-win-${{ steps.tag.outputs.version }}
 
+      # Upstream pins an exact Bun revision in packages/opencode/script/build.ts
+      # (`Bun.revision !== KiloBun.pin.revision` -> throw), which always fails
+      # with our Penryn-rebuilt bun (different revision hash). Neutralize it.
+      - name: Patch upstream Bun revision pin
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          F="${{ github.workspace }}/kilocode/packages/opencode/script/build.ts"
+          [ -f "$F" ] || { echo "build.ts not found"; exit 1; }
+          if grep -q "Bun.revision !== KiloBun.pin.revision" "$F"; then
+            sed -i 's/if (Bun.revision !== KiloBun.pin.revision)/if (false)/' "$F"
+            echo "Bun revision pin neutralized in $F"
+          else
+            echo "no Bun revision pin found (already patched or removed upstream)"
+          fi
+          # Upstream picks the compile runtime as the build-time bun only when
+          # NIX_BUILD_TOP is set; otherwise it downloads the stock upstream
+          # bun (contains POPCNT) and the final binary fails the ISA verify.
+          # Force process.execPath (our penryn bun) for the native target.
+          if grep -q "process.env.NIX_BUILD_TOP &&" "$F"; then
+            sed -i 's/process.env.NIX_BUILD_TOP &&/true \&\&/' "$F"
+            echo "compile runtime forced to process.execPath in $F"
+          else
+            echo "no NIX_BUILD_TOP runtime selector found in $F"
+          fi
+
       - name: Install deps
         if: steps.restore.outputs.found_artifact != 'true'
         run: |
